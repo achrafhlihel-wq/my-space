@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                          ICT_SmartMoney_EA.mq5   |
 //|                        ICT Smart Money Concepts Expert Advisor    |
-//|                    v3.0 - Fixed Entry/SL Ratio Problem            |
+//|              v4.0 - Fixed TP Distance + Added Trailing Stop       |
 //+------------------------------------------------------------------+
 #property copyright "ICT SMC Bot"
 #property link      ""
-#property version   "3.00"
+#property version   "4.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -31,17 +31,25 @@ input int      InpMaxTradesPerPair = 1;            // Max trades per pair
 // === Stop Loss ===
 input int      InpSL_MarginEU    = 3;              // SL margin EURUSD (pips)
 input int      InpSL_MarginGold  = 30;             // SL margin XAUUSD (points)
-input int      InpMaxSL_EU       = 25;             // Max SL EURUSD (pips) - REJECTS if bigger
+input int      InpMaxSL_EU       = 25;             // Max SL EURUSD (pips)
 input int      InpMaxSL_Gold     = 400;            // Max SL XAUUSD (points)
+input int      InpMinSL_EU       = 8;              // Min SL EURUSD (pips) - NOT too tight!
+input int      InpMinSL_Gold     = 80;             // Min SL XAUUSD (points)
 
 // === Take Profit ===
-input double   InpRR_Ratio       = 3.0;            // Risk:Reward ratio
+input double   InpRR_Ratio       = 2.0;            // Target R:R ratio (reduced from 3!)
 input double   InpMinRR_Ratio    = 1.5;            // Min R:R to accept trade
-input bool     InpUsePartialClose = true;          // Use partial close at 2:1
+input double   InpMaxRR_Ratio    = 4.0;            // Max R:R - reject if higher (SL too small!)
+input bool     InpUsePartialClose = true;          // Use partial close at 1.5:1
 input double   InpPartialPercent = 50.0;           // Partial close %
 
+// === Trailing Stop ===
+input bool     InpUseTrailing    = true;           // Use trailing stop
+input double   InpTrailStart     = 1.0;            // Start trailing at X:1 RR
+input double   InpTrailStep      = 0.5;            // Trail step (fraction of risk)
+
 // === Entry Mode ===
-input bool     InpUseLimitOrders = true;           // Use Limit Orders (better entry)
+input bool     InpUseLimitOrders = false;          // Use Limit Orders (OFF - use market!)
 input int      InpLimitExpiry    = 3;              // Limit order expiry (bars)
 
 // === Time Filter (Server Time) ===
@@ -140,11 +148,12 @@ int OnInit()
       g_entryZoneBottom[i] = 0;
    }
    
-   Print("=== ICT Smart Money EA v3.0 ===");
-   Print("KEY FIX: Tight SL on OB/FVG zone, Limit orders, R:R validation");
+   Print("=== ICT Smart Money EA v4.0 ===");
+   Print("KEY FIX: Realistic TP (2:1), Min SL, Max RR cap, Trailing Stop");
    Print("Entry TF: ", EnumToString(InpEntryTF));
-   Print("Min R:R: ", InpMinRR_Ratio);
-   Print("Use Limits: ", InpUseLimitOrders);
+   Print("Target RR: ", InpRR_Ratio, " | Min: ", InpMinRR_Ratio, " | Max: ", InpMaxRR_Ratio);
+   Print("Trailing: ", InpUseTrailing, " | Start: ", InpTrailStart, "R");
+   Print("Limit Orders: ", InpUseLimitOrders);
    
    return(INIT_SUCCEEDED);
 }
@@ -159,7 +168,7 @@ void OnDeinit(const int reason)
          trade.OrderDelete(ticket);
    }
    Comment("");
-   Print("ICT Smart Money EA v3.0 removed.");
+   Print("ICT Smart Money EA v4.0 removed.");
 }
 
 
@@ -277,16 +286,29 @@ void ProcessSymbol(string symbol, int symIdx)
       tp = entry - (risk * InpRR_Ratio);
    }
    
-   // === VALIDATE: Reject if SL too big ===
+   // === VALIDATE: Reject if SL too big OR too small ===
    double slPips = risk / point;
-   double maxSL = IsGold(symbol) ? InpMaxSL_Gold : InpMaxSL_EU * 10; // Convert pips to points for EU
-   if(slPips > maxSL || slPips < 5)
+   double maxSL = IsGold(symbol) ? InpMaxSL_Gold : InpMaxSL_EU * 10;
+   double minSL = IsGold(symbol) ? InpMinSL_Gold : InpMinSL_EU * 10;
+   
+   if(slPips > maxSL)
    {
-      Print("[", symbol, "] REJECTED: SL too big/small: ", slPips, " pts (max: ", maxSL, ")");
+      Print("[", symbol, "] REJECTED: SL too big: ", DoubleToString(slPips,1), " pts (max: ", maxSL, ")");
       return;
    }
+   if(slPips < minSL)
+   {
+      // SL too tight - extend it to minimum
+      if(trend == TREND_BULLISH)
+         sl = entry - minSL * point;
+      else
+         sl = entry + minSL * point;
+      risk = MathAbs(entry - sl);
+      tp = (trend == TREND_BULLISH) ? entry + risk * InpRR_Ratio : entry - risk * InpRR_Ratio;
+      Print("[", symbol, "] SL extended to minimum: ", minSL, " pts");
+   }
    
-   // === VALIDATE: Check actual R:R ===
+   // === VALIDATE: Check actual R:R (reject if too high = TP unreachable) ===
    double currentPrice = (trend == TREND_BULLISH) ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
    double actualRisk = MathAbs(currentPrice - sl);
    double potentialReward = MathAbs(tp - currentPrice);
@@ -294,8 +316,18 @@ void ProcessSymbol(string symbol, int symIdx)
    
    if(actualRR < InpMinRR_Ratio)
    {
-      Print("[", symbol, "] REJECTED: R:R too low: ", DoubleToString(actualRR, 2), " (min: ", InpMinRR_Ratio, ")");
+      Print("[", symbol, "] REJECTED: R:R too low: ", DoubleToString(actualRR, 2));
       return;
+   }
+   if(actualRR > InpMaxRR_Ratio)
+   {
+      // R:R too high means SL is too tight or TP unreachable - cap it
+      if(trend == TREND_BULLISH)
+         tp = currentPrice + actualRisk * InpMaxRR_Ratio;
+      else
+         tp = currentPrice - actualRisk * InpMaxRR_Ratio;
+      actualRR = InpMaxRR_Ratio;
+      Print("[", symbol, "] R:R capped to ", InpMaxRR_Ratio);
    }
    
    // === SCORING ===
@@ -741,7 +773,7 @@ int CalculateScore(ENUM_TREND trend, bool sweep, bool mss, bool fvg, bool ob)
 
 
 //+------------------------------------------------------------------+
-//| TRADE MANAGEMENT (BE + Partial Close)                            |
+//| TRADE MANAGEMENT (BE + Trailing + Partial Close)                 |
 //+------------------------------------------------------------------+
 void ManageOpenPositions()
 {
@@ -756,6 +788,8 @@ void ManageOpenPositions()
       double tp = posInfo.TakeProfit();
       ulong ticket = posInfo.Ticket();
       long posType = posInfo.PositionType();
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
       
       double riskDist = MathAbs(openPrice - sl);
       if(riskDist == 0) continue;
@@ -766,40 +800,76 @@ void ManageOpenPositions()
       {
          currentPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
          profit = currentPrice - openPrice;
+         double rrAchieved = profit / riskDist;
          
-         // BE at 1:1
-         if(profit >= riskDist && sl < openPrice)
+         // Step 1: Move to Break Even at 1:1
+         if(rrAchieved >= 1.0 && sl < openPrice)
          {
-            double newSL = openPrice + SymbolInfoDouble(symbol, SYMBOL_POINT) * 3;
-            trade.PositionModify(ticket, NormalizeDouble(newSL, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)), tp);
+            double newSL = openPrice + point * 3;
+            trade.PositionModify(ticket, NormalizeDouble(newSL, digits), tp);
+            Print("[", symbol, "] Moved to BE");
          }
          
-         // Partial at 2:1
-         if(InpUsePartialClose && profit >= riskDist * 2.0 && sl >= openPrice)
+         // Step 2: Partial close at 1.5:1
+         if(InpUsePartialClose && rrAchieved >= 1.5 && sl >= openPrice)
          {
             double vol = posInfo.Volume();
+            double minVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
             double closeVol = NormalizeVolume(symbol, vol * (InpPartialPercent / 100.0));
-            if(closeVol > 0 && vol > closeVol)
+            if(closeVol >= minVol && vol > closeVol + minVol)
+            {
                trade.PositionClosePartial(ticket, closeVol);
+               Print("[", symbol, "] Partial close at 1.5R: ", closeVol, " lots");
+            }
+         }
+         
+         // Step 3: Trailing Stop
+         if(InpUseTrailing && rrAchieved >= InpTrailStart && sl >= openPrice)
+         {
+            double trailStep = riskDist * InpTrailStep;
+            double newSL = currentPrice - trailStep;
+            if(newSL > sl + point)
+            {
+               trade.PositionModify(ticket, NormalizeDouble(newSL, digits), tp);
+            }
          }
       }
-      else
+      else // SELL
       {
          currentPrice = SymbolInfoDouble(symbol, SYMBOL_ASK);
          profit = openPrice - currentPrice;
+         double rrAchieved = profit / riskDist;
          
-         if(profit >= riskDist && sl > openPrice)
+         // Step 1: BE at 1:1
+         if(rrAchieved >= 1.0 && sl > openPrice)
          {
-            double newSL = openPrice - SymbolInfoDouble(symbol, SYMBOL_POINT) * 3;
-            trade.PositionModify(ticket, NormalizeDouble(newSL, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)), tp);
+            double newSL = openPrice - point * 3;
+            trade.PositionModify(ticket, NormalizeDouble(newSL, digits), tp);
+            Print("[", symbol, "] Moved to BE");
          }
          
-         if(InpUsePartialClose && profit >= riskDist * 2.0 && sl <= openPrice)
+         // Step 2: Partial close at 1.5:1
+         if(InpUsePartialClose && rrAchieved >= 1.5 && sl <= openPrice)
          {
             double vol = posInfo.Volume();
+            double minVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
             double closeVol = NormalizeVolume(symbol, vol * (InpPartialPercent / 100.0));
-            if(closeVol > 0 && vol > closeVol)
+            if(closeVol >= minVol && vol > closeVol + minVol)
+            {
                trade.PositionClosePartial(ticket, closeVol);
+               Print("[", symbol, "] Partial close at 1.5R: ", closeVol, " lots");
+            }
+         }
+         
+         // Step 3: Trailing Stop
+         if(InpUseTrailing && rrAchieved >= InpTrailStart && sl <= openPrice)
+         {
+            double trailStep = riskDist * InpTrailStep;
+            double newSL = currentPrice + trailStep;
+            if(newSL < sl - point)
+            {
+               trade.PositionModify(ticket, NormalizeDouble(newSL, digits), tp);
+            }
          }
       }
    }
@@ -1011,21 +1081,21 @@ void DisplayStatus(string symbol)
                      (trend == TREND_BEARISH) ? "BEARISH" : "RANGING";
    
    Comment(StringFormat(
-      "=== ICT Smart Money EA v3.0 ===\n"
+      "=== ICT Smart Money EA v4.0 ===\n"
       "Symbol: %s | TF: %s\n"
       "H1 Trend: %s\n"
       "Sweep: %s (%.5f)\n"
       "MSS: %s\n"
       "Trades: %d/%d | P&L: %.2f\n"
       "Session: %s | Spread: %d\n"
-      "R:R Min: %.1f | SL Mode: TIGHT (Zone-based)\n",
+      "Target RR: %.1f | Trailing: %s\n",
       symbol, EnumToString(InpEntryTF), trendStr,
       g_sweepDetected[symIdx] ? "YES" : "NO", g_sweepLevel[symIdx],
       g_mssDetected[symIdx] ? "YES" : "NO",
       g_todayTrades, InpMaxTradesDay, g_todayPnL,
       IsWithinTradingSession() ? "YES" : "NO",
       (int)SymbolInfoInteger(symbol, SYMBOL_SPREAD),
-      InpMinRR_Ratio
+      InpRR_Ratio, InpUseTrailing ? "ON" : "OFF"
    ));
 }
 
