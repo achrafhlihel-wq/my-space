@@ -1,0 +1,2 @@
+Trade #,Date,Pair,Timeframe,Direction,Entry Price,Stop Loss (SL),R1.1,R1.2,R1.3,Risk (pips),R1.1 Reward,R1.2 Reward,R1.3 Reward,RR 1.1,RR 1.2,RR 1.3
+1,2026-06-16,XAU/USD,5min,SELL,4338.19,4348.61,4331.77,4324.92,4318.81,10.42,6.42,13.27,19.38,0.62,1.27,1.86

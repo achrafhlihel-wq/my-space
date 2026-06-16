@@ -1,0 +1,131 @@
+// ============================================================
+// 📊 AUTO TRADE LOGGER - Strategy Version
+// ============================================================
+// This STRATEGY version automatically detects entries based on
+// your conditions and sends alerts with Entry/SL/TP via webhook.
+//
+// CUSTOMIZE: Change the entry conditions to match YOUR strategy
+// ============================================================
+
+//@version=5
+strategy("Auto Trade Logger Strategy", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=1)
+
+// ============================================================
+// STRATEGY INPUTS
+// ============================================================
+
+// Risk Management
+riskReward1 = input.float(1.1, "R:R for TP1", step=0.1)
+riskReward2 = input.float(2.2, "R:R for TP2", step=0.1)
+riskReward3 = input.float(3.3, "R:R for TP3", step=0.1)
+atrLength = input.int(14, "ATR Length (for SL calculation)")
+atrMultiplier = input.float(1.5, "ATR Multiplier for SL", step=0.1)
+
+// Strategy Parameters (CUSTOMIZE THESE)
+emaFast = input.int(9, "Fast EMA")
+emaSlow = input.int(21, "Slow EMA")
+rsiLength = input.int(14, "RSI Length")
+rsiOverbought = input.int(70, "RSI Overbought")
+rsiOversold = input.int(30, "RSI Oversold")
+
+// ============================================================
+// INDICATORS
+// ============================================================
+
+fastMA = ta.ema(close, emaFast)
+slowMA = ta.ema(close, emaSlow)
+rsi = ta.rsi(close, rsiLength)
+atr = ta.atr(atrLength)
+
+// ============================================================
+// ENTRY CONDITIONS (CUSTOMIZE THESE FOR YOUR STRATEGY)
+// ============================================================
+
+// Example: EMA crossover + RSI confirmation
+buyCondition = ta.crossover(fastMA, slowMA) and rsi < rsiOversold + 10
+sellCondition = ta.crossunder(fastMA, slowMA) and rsi > rsiOverbought - 10
+
+// ============================================================
+// CALCULATE LEVELS
+// ============================================================
+
+var float entryPrice = na
+var float slPrice = na
+var float tp1Price = na
+var float tp2Price = na
+var float tp3Price = na
+var string direction = ""
+
+// BUY Trade
+if buyCondition and strategy.position_size == 0
+    entryPrice := close
+    slPrice := close - (atr * atrMultiplier)
+    risk = close - slPrice
+    tp1Price := close + (risk * riskReward1)
+    tp2Price := close + (risk * riskReward2)
+    tp3Price := close + (risk * riskReward3)
+    direction := "BUY"
+    
+    strategy.entry("Long", strategy.long)
+    strategy.exit("TP1", "Long", limit=tp1Price, stop=slPrice)
+
+// SELL Trade
+if sellCondition and strategy.position_size == 0
+    entryPrice := close
+    slPrice := close + (atr * atrMultiplier)
+    risk = slPrice - close
+    tp1Price := close - (risk * riskReward1)
+    tp2Price := close - (risk * riskReward2)
+    tp3Price := close - (risk * riskReward3)
+    direction := "SELL"
+    
+    strategy.entry("Short", strategy.short)
+    strategy.exit("TP1", "Short", limit=tp1Price, stop=slPrice)
+
+// ============================================================
+// ALERTS WITH JSON (for webhook to Google Sheets)
+// ============================================================
+
+// Alert message format for webhook
+alertBuy = '{"pair":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","direction":"BUY","entry":' + str.tostring(entryPrice) + ',"sl":' + str.tostring(slPrice) + ',"tp1":' + str.tostring(tp1Price) + ',"tp2":' + str.tostring(tp2Price) + ',"tp3":' + str.tostring(tp3Price) + ',"rr1":' + str.tostring(riskReward1) + ',"rr2":' + str.tostring(riskReward2) + ',"rr3":' + str.tostring(riskReward3) + '}'
+
+alertSell = '{"pair":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","direction":"SELL","entry":' + str.tostring(entryPrice) + ',"sl":' + str.tostring(slPrice) + ',"tp1":' + str.tostring(tp1Price) + ',"tp2":' + str.tostring(tp2Price) + ',"tp3":' + str.tostring(tp3Price) + ',"rr1":' + str.tostring(riskReward1) + ',"rr2":' + str.tostring(riskReward2) + ',"rr3":' + str.tostring(riskReward3) + '}'
+
+if buyCondition
+    alert(alertBuy, alert.freq_once_per_bar)
+
+if sellCondition
+    alert(alertSell, alert.freq_once_per_bar)
+
+// ============================================================
+// PLOT LEVELS
+// ============================================================
+
+plot(strategy.position_size != 0 ? entryPrice : na, "Entry", color=color.blue, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? slPrice : na, "SL", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tp1Price : na, "TP1", color=color.green, linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tp2Price : na, "TP2", color=color.green, linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tp3Price : na, "TP3", color=color.green, linewidth=1, style=plot.style_linebr)
+
+// Background color for active trade
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 95) : strategy.position_size < 0 ? color.new(color.red, 95) : na)
+
+// ============================================================
+// INFO TABLE
+// ============================================================
+
+var table tradeTable = table.new(position.bottom_right, 2, 7, bgcolor=color.new(color.black, 80))
+
+if barstate.islast and not na(entryPrice)
+    table.cell(tradeTable, 0, 0, "Last Trade", text_color=color.white, text_size=size.small)
+    table.cell(tradeTable, 1, 0, direction, text_color=direction == "BUY" ? color.green : color.red, text_size=size.small)
+    table.cell(tradeTable, 0, 1, "Entry", text_color=color.gray, text_size=size.tiny)
+    table.cell(tradeTable, 1, 1, str.tostring(entryPrice, "#.###"), text_color=color.blue, text_size=size.tiny)
+    table.cell(tradeTable, 0, 2, "SL", text_color=color.gray, text_size=size.tiny)
+    table.cell(tradeTable, 1, 2, str.tostring(slPrice, "#.###"), text_color=color.red, text_size=size.tiny)
+    table.cell(tradeTable, 0, 3, "TP1", text_color=color.gray, text_size=size.tiny)
+    table.cell(tradeTable, 1, 3, str.tostring(tp1Price, "#.###") + " (RR:" + str.tostring(riskReward1) + ")", text_color=color.green, text_size=size.tiny)
+    table.cell(tradeTable, 0, 4, "TP2", text_color=color.gray, text_size=size.tiny)
+    table.cell(tradeTable, 1, 4, str.tostring(tp2Price, "#.###") + " (RR:" + str.tostring(riskReward2) + ")", text_color=color.green, text_size=size.tiny)
+    table.cell(tradeTable, 0, 5, "TP3", text_color=color.gray, text_size=size.tiny)
+    table.cell(tradeTable, 1, 5, str.tostring(tp3Price, "#.###") + " (RR:" + str.tostring(riskReward3) + ")", text_color=color.green, text_size=size.tiny)
