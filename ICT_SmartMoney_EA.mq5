@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "ICT SMC Bot"
 #property link      ""
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -38,29 +38,31 @@ input bool     InpUsePartialClose = true;          // Use partial close at 2:1
 input double   InpPartialPercent = 50.0;           // Partial close %
 
 // === Time Filter (Server Time) ===
-input int      InpLondonStart    = 8;              // London session start hour
+input int      InpLondonStart    = 7;              // London session start hour
 input int      InpLondonEnd      = 12;             // London session end hour
-input int      InpNYStart        = 13;             // NY session start hour
-input int      InpNYEnd          = 15;             // NY first 2 hours end
+input int      InpNYStart        = 12;             // NY session start hour
+input int      InpNYEnd          = 16;             // NY session end hour
 
 // === News Filter ===
 input int      InpNewsMinutes    = 30;             // Minutes before/after news
 
 // === Quality Filters ===
-input double   InpMaxSpread      = 30.0;           // Max spread (points)
+input double   InpMaxSpread      = 50.0;           // Max spread (points)
 input int      InpATR_Period     = 14;             // ATR period
-input double   InpMinATR_Multi   = 0.5;            // Min ATR multiplier
-input double   InpMaxWickRatio   = 0.7;            // Max wick ratio filter
+input double   InpMinATR_Multi   = 0.3;            // Min ATR multiplier (relaxed)
+input double   InpMaxWickRatio   = 0.8;            // Max wick ratio filter
 
 // === Scoring System ===
-input int      InpMinScore       = 80;             // Minimum score to trade
-
+input int      InpMinScore       = 65;             // Minimum score to trade (relaxed)
 
 // === Structure Detection ===
-input int      InpSwingLookback  = 5;              // Swing point lookback bars
-input double   InpEqualLevel_Pips = 3.0;           // Equal highs/lows tolerance (pips)
-input int      InpLiquidityBars  = 50;             // Bars to look for liquidity levels
-input int      InpFVG_MinSize    = 5;              // Min FVG size (points)
+input int      InpSwingLookback  = 3;              // Swing point lookback bars (relaxed)
+input double   InpEqualLevel_Pips = 5.0;           // Equal highs/lows tolerance (pips)
+input int      InpLiquidityBars  = 80;             // Bars to look for liquidity levels
+input int      InpFVG_MinSize    = 3;              // Min FVG size (points)
+input int      InpSweepWindow    = 5;              // Bars window for sweep detection
+input int      InpMSS_Window     = 10;             // Bars window for MSS detection
+
 
 //+------------------------------------------------------------------+
 //| GLOBAL VARIABLES                                                  |
@@ -71,42 +73,6 @@ CSymbolInfo    symInfo;
 
 // Trend state
 enum ENUM_TREND { TREND_BULLISH, TREND_BEARISH, TREND_RANGING };
-
-// Structure for swing points
-struct SwingPoint {
-   double price;
-   datetime time;
-   int barIndex;
-   bool isHigh;  // true = high, false = low
-};
-
-// Structure for liquidity levels
-struct LiquidityLevel {
-   double price;
-   datetime time;
-   bool isHigh;       // true = resistance, false = support
-   bool isSwept;      // has been swept
-   datetime sweepTime;
-};
-
-// Structure for FVG
-struct FairValueGap {
-   double top;
-   double bottom;
-   datetime time;
-   bool isBullish;    // true = bullish FVG (gap up), false = bearish FVG
-   bool isFilled;
-};
-
-// Structure for Order Block
-struct OrderBlock {
-   double top;
-   double bottom;
-   datetime time;
-   bool isBullish;    // true = bullish OB (last bearish before move up)
-   bool isUsed;
-};
-
 
 // Structure for MSS
 struct MarketStructureShift {
@@ -128,19 +94,21 @@ struct TradeSignal {
    string reason;
 };
 
-// Global state arrays
-SwingPoint     g_swingPoints[];
-LiquidityLevel g_liquidityLevels[];
-FairValueGap   g_fvgZones[];
-OrderBlock     g_orderBlocks[];
-
 // Daily tracking
 int            g_todayTrades = 0;
 double         g_todayPnL = 0.0;
 datetime       g_lastTradeDay = 0;
 bool           g_dailyLimitHit = false;
 
-// News filter (manual times - can be enhanced with calendar)
+// State tracking - allow multi-bar setup detection
+bool           g_sweepDetected[];       // per symbol
+double         g_sweepLevel[];          // per symbol
+datetime       g_sweepTime[];           // per symbol
+bool           g_mssDetected[];         // per symbol  
+datetime       g_mssTime[];             // per symbol
+ENUM_TREND     g_lastTrend[];           // per symbol
+
+// News filter
 datetime       g_newsTime = 0;
 bool           g_newsActive = false;
 
@@ -150,13 +118,34 @@ bool           g_newsActive = false;
 int OnInit()
 {
    trade.SetExpertMagicNumber(InpMagicNumber);
-   trade.SetDeviationInPoints(10);
+   trade.SetDeviationInPoints(30);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
    
-   Print("ICT Smart Money EA initialized");
+   // Initialize state arrays for 2 symbols
+   ArrayResize(g_sweepDetected, 2);
+   ArrayResize(g_sweepLevel, 2);
+   ArrayResize(g_sweepTime, 2);
+   ArrayResize(g_mssDetected, 2);
+   ArrayResize(g_mssTime, 2);
+   ArrayResize(g_lastTrend, 2);
+   
+   for(int i = 0; i < 2; i++)
+   {
+      g_sweepDetected[i] = false;
+      g_sweepLevel[i] = 0;
+      g_sweepTime[i] = 0;
+      g_mssDetected[i] = false;
+      g_mssTime[i] = 0;
+      g_lastTrend[i] = TREND_RANGING;
+   }
+   
+   Print("=== ICT Smart Money EA v2.0 ===");
    Print("Entry TF: ", EnumToString(InpEntryTF));
    Print("Trend TF: ", EnumToString(InpTrendTF));
    Print("Min Score: ", InpMinScore);
+   Print("Swing Lookback: ", InpSwingLookback);
+   Print("Sweep Window: ", InpSweepWindow, " bars");
+   Print("MSS Window: ", InpMSS_Window, " bars");
    
    return(INIT_SUCCEEDED);
 }
@@ -167,6 +156,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   Comment("");
    Print("ICT Smart Money EA removed. Reason: ", reason);
 }
 
@@ -176,35 +166,29 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    // Process each symbol
-   string symbols[];
-   int symCount = 0;
-   
-   if(StringLen(InpSymbol1) > 0) { ArrayResize(symbols, symCount+1); symbols[symCount] = InpSymbol1; symCount++; }
-   if(StringLen(InpSymbol2) > 0) { ArrayResize(symbols, symCount+1); symbols[symCount] = InpSymbol2; symCount++; }
-   
-   for(int s = 0; s < symCount; s++)
-   {
-      ProcessSymbol(symbols[s]);
-   }
+   if(StringLen(InpSymbol1) > 0) ProcessSymbol(InpSymbol1, 0);
+   if(StringLen(InpSymbol2) > 0) ProcessSymbol(InpSymbol2, 1);
    
    // Manage open positions (BE, partial close)
    ManageOpenPositions();
+   
+   // Display status
+   DisplayStatus(Symbol());
 }
 
 //+------------------------------------------------------------------+
 //| MAIN PROCESSING FUNCTION PER SYMBOL                              |
 //+------------------------------------------------------------------+
-void ProcessSymbol(string symbol)
+void ProcessSymbol(string symbol, int symIdx)
 {
    // Check if new bar on entry timeframe
    static datetime lastBar[];
-   static bool initialized = false;
-   if(!initialized) { ArrayResize(lastBar, 2); lastBar[0] = 0; lastBar[1] = 0; initialized = true; }
+   static bool barInit = false;
+   if(!barInit) { ArrayResize(lastBar, 2); lastBar[0] = 0; lastBar[1] = 0; barInit = true; }
    
-   int idx = (symbol == InpSymbol1) ? 0 : 1;
    datetime currentBar = iTime(symbol, InpEntryTF, 0);
-   if(currentBar == lastBar[idx]) return;
-   lastBar[idx] = currentBar;
+   if(currentBar == lastBar[symIdx]) return;
+   lastBar[symIdx] = currentBar;
    
    // Reset daily counters
    ResetDailyCounters();
@@ -219,81 +203,137 @@ void ProcessSymbol(string symbol)
    // Time filter
    if(!IsWithinTradingSession()) return;
    
-   // Quality filters
+   // Quality filters (relaxed)
    if(!PassQualityFilters(symbol)) return;
    
    // === PHASE 1: Determine H1 Trend ===
    ENUM_TREND trend = DetectTrend(symbol);
    if(trend == TREND_RANGING) return;
    
-   // === PHASE 2: Detect Liquidity Levels & Sweep ===
-   bool liquiditySwept = false;
-   double sweepLevel = 0;
-   liquiditySwept = DetectLiquiditySweep(symbol, trend, sweepLevel);
-   if(!liquiditySwept) return;
-
-
-   // === PHASE 3: Detect MSS ===
-   MarketStructureShift mss;
-   mss = DetectMSS(symbol, trend);
-   if(!mss.detected) return;
+   // Reset state if trend changed
+   if(trend != g_lastTrend[symIdx])
+   {
+      g_sweepDetected[symIdx] = false;
+      g_mssDetected[symIdx] = false;
+      g_lastTrend[symIdx] = trend;
+   }
    
+   // === PHASE 2: Detect Liquidity Sweep (within window) ===
+   double sweepLevel = 0;
+   if(!g_sweepDetected[symIdx])
+   {
+      if(DetectLiquiditySweep(symbol, trend, sweepLevel))
+      {
+         g_sweepDetected[symIdx] = true;
+         g_sweepLevel[symIdx] = sweepLevel;
+         g_sweepTime[symIdx] = TimeCurrent();
+         Print("[", symbol, "] Liquidity Sweep detected at: ", sweepLevel);
+      }
+      else return; // No sweep yet
+   }
+   
+   // Check sweep validity (within window)
+   int barsSinceSweep = iBarShift(symbol, InpEntryTF, g_sweepTime[symIdx]);
+   if(barsSinceSweep > InpLiquidityBars)
+   {
+      g_sweepDetected[symIdx] = false;
+      g_mssDetected[symIdx] = false;
+      return;
+   }
+   
+   // === PHASE 3: Detect MSS ===
+   if(!g_mssDetected[symIdx])
+   {
+      MarketStructureShift mss = DetectMSS(symbol, trend);
+      if(mss.detected)
+      {
+         g_mssDetected[symIdx] = true;
+         g_mssTime[symIdx] = TimeCurrent();
+         Print("[", symbol, "] MSS detected at: ", mss.breakLevel);
+      }
+      else return;
+   }
+   
+   // Check MSS validity window
+   int barsSinceMSS = iBarShift(symbol, InpEntryTF, g_mssTime[symIdx]);
+   if(barsSinceMSS > InpMSS_Window)
+   {
+      g_mssDetected[symIdx] = false;
+      return;
+   }
+
+
    // === PHASE 4: Find Entry Zone (FVG / Order Block) ===
    double entryZoneTop = 0, entryZoneBottom = 0;
-   bool hasFVG = false, hasOB = false;
-   hasFVG = FindFVG(symbol, trend, entryZoneTop, entryZoneBottom);
-   hasOB = FindOrderBlock(symbol, trend, entryZoneTop, entryZoneBottom);
+   bool hasFVG = FindFVG(symbol, trend, entryZoneTop, entryZoneBottom);
+   bool hasOB = FindOrderBlock(symbol, trend, entryZoneTop, entryZoneBottom);
    
    if(!hasFVG && !hasOB) return;
    
-   // === PHASE 5: Entry Confirmation ===
+   // === PHASE 5: Entry Confirmation (relaxed - strong candle OR pattern) ===
    bool confirmed = CheckEntryConfirmation(symbol, trend);
    if(!confirmed) return;
    
    // === SCORING SYSTEM ===
-   int score = CalculateScore(trend, liquiditySwept, mss.detected, hasFVG, hasOB);
+   int score = CalculateScore(trend, true, true, hasFVG, hasOB);
+   
+   Print("[", symbol, "] Signal Score: ", score, " (min: ", InpMinScore, ")");
+   
    if(score < InpMinScore) return;
    
    // === EXECUTE TRADE ===
-   TradeSignal signal;
-   signal.valid = true;
-   signal.isBuy = (trend == TREND_BULLISH);
-   signal.score = score;
-   
-   // Calculate SL and TP
    double slMargin = GetSLMargin(symbol);
-   if(signal.isBuy)
+   double sl, entry, tp, risk;
+   
+   if(trend == TREND_BULLISH)
    {
-      signal.stopLoss = sweepLevel - slMargin;
-      signal.entryPrice = SymbolInfoDouble(symbol, SYMBOL_ASK);
-      double risk = signal.entryPrice - signal.stopLoss;
-      signal.takeProfit = signal.entryPrice + (risk * InpRR_Ratio);
+      entry = SymbolInfoDouble(symbol, SYMBOL_ASK);
+      sl = g_sweepLevel[symIdx] - slMargin;
+      risk = entry - sl;
+      if(risk <= 0) return;
+      tp = entry + (risk * InpRR_Ratio);
    }
    else
    {
-      signal.stopLoss = sweepLevel + slMargin;
-      signal.entryPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
-      double risk = signal.stopLoss - signal.entryPrice;
-      signal.takeProfit = signal.entryPrice - (risk * InpRR_Ratio);
+      entry = SymbolInfoDouble(symbol, SYMBOL_BID);
+      sl = g_sweepLevel[symIdx] + slMargin;
+      risk = sl - entry;
+      if(risk <= 0) return;
+      tp = entry - (risk * InpRR_Ratio);
    }
    
+   // Validate SL distance (not too small, not too big)
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double slPips = risk / point;
+   if(slPips < 10 || slPips > 1000) return;
+   
    // Calculate lot size
-   double lotSize = CalculateLotSize(symbol, MathAbs(signal.entryPrice - signal.stopLoss));
+   double lotSize = CalculateLotSize(symbol, risk);
    if(lotSize <= 0) return;
    
    // Execute
-   if(signal.isBuy)
-      trade.Buy(lotSize, symbol, signal.entryPrice, signal.stopLoss, signal.takeProfit, 
-                StringFormat("ICT Buy | Score:%d", score));
+   bool result = false;
+   if(trend == TREND_BULLISH)
+      result = trade.Buy(lotSize, symbol, entry, sl, tp, 
+                StringFormat("ICT Buy|Score:%d", score));
    else
-      trade.Sell(lotSize, symbol, signal.entryPrice, signal.stopLoss, signal.takeProfit,
-                 StringFormat("ICT Sell | Score:%d", score));
+      result = trade.Sell(lotSize, symbol, entry, sl, tp,
+                StringFormat("ICT Sell|Score:%d", score));
    
-   if(trade.ResultRetcode() == TRADE_RETCODE_DONE)
+   if(trade.ResultRetcode() == TRADE_RETCODE_DONE || 
+      trade.ResultRetcode() == TRADE_RETCODE_PLACED)
    {
       g_todayTrades++;
-      Print(StringFormat("Trade opened: %s %s | Score: %d | SL: %.5f | TP: %.5f",
-            signal.isBuy ? "BUY" : "SELL", symbol, score, signal.stopLoss, signal.takeProfit));
+      // Reset state for next setup
+      g_sweepDetected[symIdx] = false;
+      g_mssDetected[symIdx] = false;
+      
+      Print(StringFormat(">>> TRADE OPENED: %s %s | Score: %d | Entry: %.5f | SL: %.5f | TP: %.5f | Lots: %.2f",
+            (trend == TREND_BULLISH) ? "BUY" : "SELL", symbol, score, entry, sl, tp, lotSize));
+   }
+   else
+   {
+      Print("Trade FAILED: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
    }
 }
 
@@ -303,44 +343,52 @@ void ProcessSymbol(string symbol)
 //+------------------------------------------------------------------+
 ENUM_TREND DetectTrend(string symbol)
 {
-   // Get H1 swing points
-   double highs[], lows[];
-   ArrayResize(highs, 4);
-   ArrayResize(lows, 4);
+   // Find swing highs and lows on H1
+   double swHighs[];
+   double swLows[];
+   ArrayResize(swHighs, 0);
+   ArrayResize(swLows, 0);
    
-   int count = 0;
    int lookback = InpSwingLookback;
    
-   // Find last 4 swing highs and 4 swing lows on H1
-   int swingHighs = 0, swingLows = 0;
-   
-   for(int i = lookback; i < 100 && (swingHighs < 4 || swingLows < 4); i++)
+   // Scan H1 bars for swings (need at least 2 of each)
+   for(int i = lookback; i < 80; i++)
    {
-      if(swingHighs < 4 && IsSwingHigh(symbol, InpTrendTF, i, lookback))
+      if(IsSwingHigh(symbol, InpTrendTF, i, lookback))
       {
-         highs[swingHighs] = iHigh(symbol, InpTrendTF, i);
-         swingHighs++;
-      }
-      if(swingLows < 4 && IsSwingLow(symbol, InpTrendTF, i, lookback))
-      {
-         lows[swingLows] = iLow(symbol, InpTrendTF, i);
-         swingLows++;
+         int size = ArraySize(swHighs);
+         ArrayResize(swHighs, size + 1);
+         swHighs[size] = iHigh(symbol, InpTrendTF, i);
+         if(ArraySize(swHighs) >= 3) break;
       }
    }
    
-   if(swingHighs < 2 || swingLows < 2) return TREND_RANGING;
+   for(int i = lookback; i < 80; i++)
+   {
+      if(IsSwingLow(symbol, InpTrendTF, i, lookback))
+      {
+         int size = ArraySize(swLows);
+         ArrayResize(swLows, size + 1);
+         swLows[size] = iLow(symbol, InpTrendTF, i);
+         if(ArraySize(swLows) >= 3) break;
+      }
+   }
    
-   // Check for Higher Highs and Higher Lows (Bullish)
-   // Note: index 0 = most recent swing
-   bool higherHighs = (highs[0] > highs[1]);
-   bool higherLows  = (lows[0] > lows[1]);
+   if(ArraySize(swHighs) < 2 || ArraySize(swLows) < 2) return TREND_RANGING;
    
-   // Check for Lower Highs and Lower Lows (Bearish)
-   bool lowerHighs = (highs[0] < highs[1]);
-   bool lowerLows  = (lows[0] < lows[1]);
+   // Index 0 = most recent
+   bool higherHighs = (swHighs[0] > swHighs[1]);
+   bool higherLows  = (swLows[0] > swLows[1]);
+   bool lowerHighs  = (swHighs[0] < swHighs[1]);
+   bool lowerLows   = (swLows[0] < swLows[1]);
    
+   // Relaxed: only need ONE condition for trend
    if(higherHighs && higherLows) return TREND_BULLISH;
    if(lowerHighs && lowerLows)   return TREND_BEARISH;
+   
+   // Partial trend detection (relaxed)
+   if(higherLows && !lowerHighs) return TREND_BULLISH;
+   if(lowerHighs && !higherLows) return TREND_BEARISH;
    
    return TREND_RANGING;
 }
@@ -351,6 +399,8 @@ ENUM_TREND DetectTrend(string symbol)
 bool IsSwingHigh(string symbol, ENUM_TIMEFRAMES tf, int bar, int lookback)
 {
    double high = iHigh(symbol, tf, bar);
+   if(high == 0) return false;
+   
    for(int i = 1; i <= lookback; i++)
    {
       if(iHigh(symbol, tf, bar - i) >= high) return false;
@@ -365,6 +415,8 @@ bool IsSwingHigh(string symbol, ENUM_TIMEFRAMES tf, int bar, int lookback)
 bool IsSwingLow(string symbol, ENUM_TIMEFRAMES tf, int bar, int lookback)
 {
    double low = iLow(symbol, tf, bar);
+   if(low == 0) return false;
+   
    for(int i = 1; i <= lookback; i++)
    {
       if(iLow(symbol, tf, bar - i) <= low) return false;
@@ -376,109 +428,69 @@ bool IsSwingLow(string symbol, ENUM_TIMEFRAMES tf, int bar, int lookback)
 
 //+------------------------------------------------------------------+
 //| PHASE 2: LIQUIDITY DETECTION & SWEEP                             |
+//| KEY FIX: Check multiple recent bars, not just bar 1              |
 //+------------------------------------------------------------------+
 bool DetectLiquiditySweep(string symbol, ENUM_TREND trend, double &sweepLevel)
 {
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double tolerance = InpEqualLevel_Pips * 10 * point; // Convert pips to price
+   double tolerance = InpEqualLevel_Pips * 10 * point;
    
-   // Find liquidity levels on entry timeframe
-   // Look for: Equal Highs, Equal Lows, Previous session H/L
-   
-   // --- Equal Highs / Equal Lows ---
-   for(int i = InpSwingLookback; i < InpLiquidityBars; i++)
+   // Check RECENT bars (1 to InpSweepWindow) for sweep
+   for(int checkBar = 1; checkBar <= InpSweepWindow; checkBar++)
    {
-      if(trend == TREND_BULLISH)
+      double barLow = iLow(symbol, InpEntryTF, checkBar);
+      double barHigh = iHigh(symbol, InpEntryTF, checkBar);
+      double barClose = iClose(symbol, InpEntryTF, checkBar);
+      
+      // Look for liquidity levels to sweep
+      for(int i = checkBar + InpSwingLookback; i < InpLiquidityBars; i++)
       {
-         // For buys, look for equal lows that got swept
-         if(IsSwingLow(symbol, InpEntryTF, i, InpSwingLookback))
+         if(trend == TREND_BULLISH)
          {
-            double swLow = iLow(symbol, InpEntryTF, i);
-            
-            // Check if there's another equal low nearby
-            for(int j = i + 1; j < InpLiquidityBars; j++)
+            // Look for swing lows that got swept downward
+            if(IsSwingLow(symbol, InpEntryTF, i, InpSwingLookback))
             {
-               if(IsSwingLow(symbol, InpEntryTF, j, InpSwingLookback))
+               double swLow = iLow(symbol, InpEntryTF, i);
+               
+               // Sweep condition: bar went below swing low but closed above
+               if(barLow < swLow - (tolerance * 0.5) && barClose > swLow)
                {
-                  double swLow2 = iLow(symbol, InpEntryTF, j);
-                  if(MathAbs(swLow - swLow2) <= tolerance)
-                  {
-                     // Equal lows found - check for sweep
-                     // Sweep = price went below then closed back above
-                     double recentLow = iLow(symbol, InpEntryTF, 1);
-                     double recentClose = iClose(symbol, InpEntryTF, 1);
-                     
-                     if(recentLow < swLow && recentClose > swLow)
-                     {
-                        sweepLevel = swLow;
-                        return true;
-                     }
-                  }
+                  sweepLevel = swLow;
+                  return true;
                }
-            }
-            
-            // Also check single swing low sweep
-            double recentLow = iLow(symbol, InpEntryTF, 1);
-            double recentClose = iClose(symbol, InpEntryTF, 1);
-            if(recentLow < swLow - tolerance && recentClose > swLow)
-            {
-               sweepLevel = swLow;
-               return true;
             }
          }
-      }
-      else if(trend == TREND_BEARISH)
-      {
-         // For sells, look for equal highs that got swept
-         if(IsSwingHigh(symbol, InpEntryTF, i, InpSwingLookback))
+         else if(trend == TREND_BEARISH)
          {
-            double swHigh = iHigh(symbol, InpEntryTF, i);
-            
-            // Check for equal high
-            for(int j = i + 1; j < InpLiquidityBars; j++)
+            // Look for swing highs that got swept upward
+            if(IsSwingHigh(symbol, InpEntryTF, i, InpSwingLookback))
             {
-               if(IsSwingHigh(symbol, InpEntryTF, j, InpSwingLookback))
+               double swHigh = iHigh(symbol, InpEntryTF, i);
+               
+               // Sweep condition: bar went above swing high but closed below
+               if(barHigh > swHigh + (tolerance * 0.5) && barClose < swHigh)
                {
-                  double swHigh2 = iHigh(symbol, InpEntryTF, j);
-                  if(MathAbs(swHigh - swHigh2) <= tolerance)
-                  {
-                     double recentHigh = iHigh(symbol, InpEntryTF, 1);
-                     double recentClose = iClose(symbol, InpEntryTF, 1);
-                     
-                     if(recentHigh > swHigh && recentClose < swHigh)
-                     {
-                        sweepLevel = swHigh;
-                        return true;
-                     }
-                  }
+                  sweepLevel = swHigh;
+                  return true;
                }
-            }
-            
-            // Single swing high sweep
-            double recentHigh = iHigh(symbol, InpEntryTF, 1);
-            double recentClose = iClose(symbol, InpEntryTF, 1);
-            if(recentHigh > swHigh + tolerance && recentClose < swHigh)
-            {
-               sweepLevel = swHigh;
-               return true;
             }
          }
       }
    }
-
-
-   // --- Previous Session High/Low Sweep ---
-   // Find previous day's high/low
+   
+   // --- Also check Previous Session High/Low Sweep ---
    double prevDayHigh = 0, prevDayLow = 99999;
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
+   int todayDOW = dt.day_of_week;
    
-   for(int i = 1; i < 200; i++)
+   for(int i = 1; i < 300; i++)
    {
       MqlDateTime barDt;
-      TimeToStruct(iTime(symbol, InpEntryTF, i), barDt);
+      datetime barTime = iTime(symbol, InpEntryTF, i);
+      if(barTime == 0) break;
+      TimeToStruct(barTime, barDt);
       
-      // Previous day bars
       if(barDt.day != dt.day)
       {
          double h = iHigh(symbol, InpEntryTF, i);
@@ -486,35 +498,38 @@ bool DetectLiquiditySweep(string symbol, ENUM_TREND trend, double &sweepLevel)
          if(h > prevDayHigh) prevDayHigh = h;
          if(l < prevDayLow)  prevDayLow = l;
          
-         // Stop after we've gone back one full day
-         MqlDateTime prevBarDt;
-         if(i+1 < 200)
+         // Check if we've gone past one full previous day
+         if(i + 1 < 300)
          {
-            TimeToStruct(iTime(symbol, InpEntryTF, i+1), prevBarDt);
-            if(prevBarDt.day != barDt.day && prevDayHigh > 0) break;
+            MqlDateTime nextDt;
+            TimeToStruct(iTime(symbol, InpEntryTF, i+1), nextDt);
+            if(nextDt.day != barDt.day && prevDayHigh > 0) break;
          }
       }
    }
    
-   // Check sweep of previous session levels
-   if(trend == TREND_BULLISH && prevDayLow < 99999)
+   // Check recent bars for session level sweep
+   for(int checkBar = 1; checkBar <= InpSweepWindow; checkBar++)
    {
-      double recentLow = iLow(symbol, InpEntryTF, 1);
-      double recentClose = iClose(symbol, InpEntryTF, 1);
-      if(recentLow < prevDayLow && recentClose > prevDayLow)
+      double barLow = iLow(symbol, InpEntryTF, checkBar);
+      double barHigh = iHigh(symbol, InpEntryTF, checkBar);
+      double barClose = iClose(symbol, InpEntryTF, checkBar);
+      
+      if(trend == TREND_BULLISH && prevDayLow < 99999)
       {
-         sweepLevel = prevDayLow;
-         return true;
+         if(barLow < prevDayLow && barClose > prevDayLow)
+         {
+            sweepLevel = prevDayLow;
+            return true;
+         }
       }
-   }
-   else if(trend == TREND_BEARISH && prevDayHigh > 0)
-   {
-      double recentHigh = iHigh(symbol, InpEntryTF, 1);
-      double recentClose = iClose(symbol, InpEntryTF, 1);
-      if(recentHigh > prevDayHigh && recentClose < prevDayHigh)
+      else if(trend == TREND_BEARISH && prevDayHigh > 0)
       {
-         sweepLevel = prevDayHigh;
-         return true;
+         if(barHigh > prevDayHigh && barClose < prevDayHigh)
+         {
+            sweepLevel = prevDayHigh;
+            return true;
+         }
       }
    }
    
@@ -524,6 +539,7 @@ bool DetectLiquiditySweep(string symbol, ENUM_TREND trend, double &sweepLevel)
 
 //+------------------------------------------------------------------+
 //| PHASE 3: MARKET STRUCTURE SHIFT (MSS) DETECTION                  |
+//| KEY FIX: Look at wider window, not just bar 1                    |
 //+------------------------------------------------------------------+
 MarketStructureShift DetectMSS(string symbol, ENUM_TREND trend)
 {
@@ -534,71 +550,58 @@ MarketStructureShift DetectMSS(string symbol, ENUM_TREND trend)
    mss.time = 0;
    mss.barIndex = 0;
    
-   // MSS = After liquidity sweep, price breaks internal structure
-   // Bullish MSS: breaks above last internal swing high
-   // Bearish MSS: breaks below last internal swing low
-   
-   // Find internal structure on entry TF (last 20 bars after sweep)
    if(trend == TREND_BULLISH)
    {
-      // Find last internal swing high
-      double lastSwingHigh = 0;
-      int shBar = 0;
-      
-      for(int i = 2; i < 20; i++)
+      // Find internal swing highs to break above
+      for(int sh = 3; sh < 25; sh++)
       {
-         if(IsSwingHigh(symbol, InpEntryTF, i, 2))
+         if(IsSwingHigh(symbol, InpEntryTF, sh, 2))
          {
-            lastSwingHigh = iHigh(symbol, InpEntryTF, i);
-            shBar = i;
-            break;
+            double swingHigh = iHigh(symbol, InpEntryTF, sh);
+            
+            // Check if any recent bar (1 to MSS_Window) broke above
+            for(int b = 1; b < MathMin(sh, InpMSS_Window); b++)
+            {
+               double closeB = iClose(symbol, InpEntryTF, b);
+               if(closeB > swingHigh)
+               {
+                  mss.detected = true;
+                  mss.isBullish = true;
+                  mss.breakLevel = swingHigh;
+                  mss.time = iTime(symbol, InpEntryTF, b);
+                  mss.barIndex = b;
+                  return mss;
+               }
+            }
+            break; // Only check first swing high found
          }
-      }
-      
-      if(lastSwingHigh == 0) return mss;
-      
-      // Check if current/last bar broke above this swing high
-      double currentHigh = iHigh(symbol, InpEntryTF, 1);
-      double currentClose = iClose(symbol, InpEntryTF, 1);
-      
-      if(currentClose > lastSwingHigh)
-      {
-         mss.detected = true;
-         mss.isBullish = true;
-         mss.breakLevel = lastSwingHigh;
-         mss.time = iTime(symbol, InpEntryTF, 1);
-         mss.barIndex = 1;
       }
    }
    else if(trend == TREND_BEARISH)
    {
-      // Find last internal swing low
-      double lastSwingLow = 0;
-      int slBar = 0;
-      
-      for(int i = 2; i < 20; i++)
+      // Find internal swing lows to break below
+      for(int sl = 3; sl < 25; sl++)
       {
-         if(IsSwingLow(symbol, InpEntryTF, i, 2))
+         if(IsSwingLow(symbol, InpEntryTF, sl, 2))
          {
-            lastSwingLow = iLow(symbol, InpEntryTF, i);
-            slBar = i;
+            double swingLow = iLow(symbol, InpEntryTF, sl);
+            
+            // Check if any recent bar broke below
+            for(int b = 1; b < MathMin(sl, InpMSS_Window); b++)
+            {
+               double closeB = iClose(symbol, InpEntryTF, b);
+               if(closeB < swingLow)
+               {
+                  mss.detected = true;
+                  mss.isBullish = false;
+                  mss.breakLevel = swingLow;
+                  mss.time = iTime(symbol, InpEntryTF, b);
+                  mss.barIndex = b;
+                  return mss;
+               }
+            }
             break;
          }
-      }
-      
-      if(lastSwingLow == 0) return mss;
-      
-      // Check if current/last bar broke below this swing low
-      double currentLow = iLow(symbol, InpEntryTF, 1);
-      double currentClose = iClose(symbol, InpEntryTF, 1);
-      
-      if(currentClose < lastSwingLow)
-      {
-         mss.detected = true;
-         mss.isBullish = false;
-         mss.breakLevel = lastSwingLow;
-         mss.time = iTime(symbol, InpEntryTF, 1);
-         mss.barIndex = 1;
       }
    }
    
@@ -611,47 +614,31 @@ MarketStructureShift DetectMSS(string symbol, ENUM_TREND trend)
 //+------------------------------------------------------------------+
 bool FindFVG(string symbol, ENUM_TREND trend, double &zoneTop, double &zoneBottom)
 {
-   // FVG Definition:
-   // Bullish FVG: Low of candle[i-1] > High of candle[i+1] (gap between)
-   // Bearish FVG: High of candle[i-1] < Low of candle[i+1] (gap between)
-   
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    double minSize = InpFVG_MinSize * point;
    
-   // Look for FVG in last 15 bars after MSS
-   for(int i = 2; i < 15; i++)
+   // Look for FVG in last 20 bars
+   for(int i = 2; i < 20; i++)
    {
-      double high1 = iHigh(symbol, InpEntryTF, i+1);  // Candle before
-      double low1  = iLow(symbol, InpEntryTF, i+1);
-      double high2 = iHigh(symbol, InpEntryTF, i);    // Middle candle
-      double low2  = iLow(symbol, InpEntryTF, i);
-      double high3 = iHigh(symbol, InpEntryTF, i-1);  // Candle after
-      double low3  = iLow(symbol, InpEntryTF, i-1);
+      double high_prev = iHigh(symbol, InpEntryTF, i+1);  // Candle before (oldest)
+      double low_prev  = iLow(symbol, InpEntryTF, i+1);
+      double high_mid  = iHigh(symbol, InpEntryTF, i);    // Middle candle
+      double low_mid   = iLow(symbol, InpEntryTF, i);
+      double high_next = iHigh(symbol, InpEntryTF, i-1);  // Candle after (newest)
+      double low_next  = iLow(symbol, InpEntryTF, i-1);
       
       if(trend == TREND_BULLISH)
       {
-         // Bullish FVG: gap between candle before's high and candle after's low
-         double gapBottom = high1;
-         double gapTop = low3;
-         
-         if(gapTop > gapBottom && (gapTop - gapBottom) >= minSize)
+         // Bullish FVG: gap between prev candle high and next candle low
+         if(low_next > high_prev + minSize)
          {
-            // Check if price is currently at or approaching this FVG
+            double gapTop = low_next;
+            double gapBottom = high_prev;
+            
             double currentPrice = SymbolInfoDouble(symbol, SYMBOL_ASK);
-            if(currentPrice <= gapTop && currentPrice >= gapBottom)
-            {
-               zoneTop = gapTop;
-               zoneBottom = gapBottom;
-               return true;
-            }
-            // Price above FVG but hasn't filled it yet
-            if(currentPrice > gapTop)
-            {
-               // FVG already passed
-               continue;
-            }
-            // Price approaching FVG from above
-            if(currentPrice >= gapBottom - (gapTop - gapBottom))
+            // Price is in or near the FVG zone
+            double zoneRange = gapTop - gapBottom;
+            if(currentPrice >= gapBottom - zoneRange && currentPrice <= gapTop + zoneRange)
             {
                zoneTop = gapTop;
                zoneBottom = gapBottom;
@@ -661,24 +648,15 @@ bool FindFVG(string symbol, ENUM_TREND trend, double &zoneTop, double &zoneBotto
       }
       else if(trend == TREND_BEARISH)
       {
-         // Bearish FVG: gap between candle before's low and candle after's high
-         double gapTop = low1;
-         double gapBottom = high3;
-         
-         if(gapTop > gapBottom && (gapTop - gapBottom) >= minSize)
+         // Bearish FVG: gap between prev candle low and next candle high
+         if(low_prev > high_next + minSize)
          {
+            double gapTop = low_prev;
+            double gapBottom = high_next;
+            
             double currentPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
-            if(currentPrice >= gapBottom && currentPrice <= gapTop)
-            {
-               zoneTop = gapTop;
-               zoneBottom = gapBottom;
-               return true;
-            }
-            if(currentPrice < gapBottom)
-            {
-               continue;
-            }
-            if(currentPrice <= gapTop + (gapTop - gapBottom))
+            double zoneRange = gapTop - gapBottom;
+            if(currentPrice >= gapBottom - zoneRange && currentPrice <= gapTop + zoneRange)
             {
                zoneTop = gapTop;
                zoneBottom = gapBottom;
@@ -690,83 +668,69 @@ bool FindFVG(string symbol, ENUM_TREND trend, double &zoneTop, double &zoneBotto
    
    return false;
 }
-
 
 //+------------------------------------------------------------------+
 //| PHASE 4B: ORDER BLOCK DETECTION                                  |
 //+------------------------------------------------------------------+
 bool FindOrderBlock(string symbol, ENUM_TREND trend, double &zoneTop, double &zoneBottom)
 {
-   // Order Block Definition:
-   // Bullish OB: Last bearish candle before a strong bullish move
-   // Bearish OB: Last bullish candle before a strong bearish move
-   
-   for(int i = 2; i < 20; i++)
+   for(int i = 2; i < 25; i++)
    {
       double open_i  = iOpen(symbol, InpEntryTF, i);
       double close_i = iClose(symbol, InpEntryTF, i);
       double high_i  = iHigh(symbol, InpEntryTF, i);
       double low_i   = iLow(symbol, InpEntryTF, i);
       
-      // Next candle (the one that made the move)
       double open_next  = iOpen(symbol, InpEntryTF, i-1);
       double close_next = iClose(symbol, InpEntryTF, i-1);
-      double high_next  = iHigh(symbol, InpEntryTF, i-1);
-      double low_next   = iLow(symbol, InpEntryTF, i-1);
       
       double bodySize_i = MathAbs(close_i - open_i);
       double bodySize_next = MathAbs(close_next - open_next);
       
+      if(bodySize_i == 0) continue;
+      
       if(trend == TREND_BULLISH)
       {
-         // Bullish OB: bearish candle followed by strong bullish candle
+         // Bullish OB: bearish candle followed by strong bullish
          bool isBearish = (close_i < open_i);
          bool isBullishNext = (close_next > open_next);
-         bool isStrong = (bodySize_next > bodySize_i * 1.5);
+         bool isStrong = (bodySize_next > bodySize_i * 1.2); // Relaxed from 1.5
          
          if(isBearish && isBullishNext && isStrong)
          {
-            // OB zone is the body of the bearish candle
-            double obTop = open_i;   // Open of bearish candle (higher)
-            double obBottom = close_i; // Close of bearish candle (lower)
+            double obTop = open_i;
+            double obBottom = close_i;
             
-            // Check if price is in or near this zone
             double currentPrice = SymbolInfoDouble(symbol, SYMBOL_ASK);
-            if(currentPrice >= obBottom && currentPrice <= obTop)
+            double obRange = obTop - obBottom;
+            
+            // Price within or near OB (with margin)
+            if(currentPrice >= obBottom - obRange * 0.5 && 
+               currentPrice <= obTop + obRange * 0.5)
             {
                if(zoneTop == 0) { zoneTop = obTop; zoneBottom = obBottom; }
-               else { // Overlap with FVG gives priority
-                  if(obBottom <= zoneTop && obTop >= zoneBottom) {
-                     zoneTop = MathMax(zoneTop, obTop);
-                     zoneBottom = MathMin(zoneBottom, obBottom);
-                  }
-               }
                return true;
             }
          }
       }
       else if(trend == TREND_BEARISH)
       {
-         // Bearish OB: bullish candle followed by strong bearish candle
          bool isBullish = (close_i > open_i);
          bool isBearishNext = (close_next < open_next);
-         bool isStrong = (bodySize_next > bodySize_i * 1.5);
+         bool isStrong = (bodySize_next > bodySize_i * 1.2);
          
          if(isBullish && isBearishNext && isStrong)
          {
-            double obTop = close_i;  // Close of bullish candle (higher)
-            double obBottom = open_i; // Open of bullish candle (lower)
+            double obTop = close_i;
+            double obBottom = open_i;
             
             double currentPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
-            if(currentPrice >= obBottom && currentPrice <= obTop)
+            double obRange = obTop - obBottom;
+            
+            if(currentPrice >= obBottom - obRange * 0.5 && 
+               currentPrice <= obTop + obRange * 0.5)
             {
                if(zoneTop == 0) { zoneTop = obTop; zoneBottom = obBottom; }
-               else {
-                  if(obBottom <= zoneTop && obTop >= zoneBottom) {
-                     zoneTop = MathMax(zoneTop, obTop);
-                     zoneBottom = MathMin(zoneBottom, obBottom);
-                  }
-               }
                return true;
             }
          }
@@ -778,50 +742,58 @@ bool FindOrderBlock(string symbol, ENUM_TREND trend, double &zoneTop, double &zo
 
 
 //+------------------------------------------------------------------+
-//| PHASE 5: ENTRY CONFIRMATION (Rejection / Engulfing)              |
+//| PHASE 5: ENTRY CONFIRMATION                                      |
+//| KEY FIX: More relaxed - accepts strong directional candle too    |
 //+------------------------------------------------------------------+
 bool CheckEntryConfirmation(string symbol, ENUM_TREND trend)
 {
-   // Check last completed candle for confirmation pattern
-   double open1  = iOpen(symbol, InpEntryTF, 1);
-   double close1 = iClose(symbol, InpEntryTF, 1);
-   double high1  = iHigh(symbol, InpEntryTF, 1);
-   double low1   = iLow(symbol, InpEntryTF, 1);
-   
-   double open2  = iOpen(symbol, InpEntryTF, 2);
-   double close2 = iClose(symbol, InpEntryTF, 2);
-   double high2  = iHigh(symbol, InpEntryTF, 2);
-   double low2   = iLow(symbol, InpEntryTF, 2);
-   
-   double body1 = MathAbs(close1 - open1);
-   double range1 = high1 - low1;
-   double body2 = MathAbs(close2 - open2);
-   
-   if(range1 == 0) return false;
-   
-   if(trend == TREND_BULLISH)
+   // Check last 3 candles for any confirmation pattern
+   for(int bar = 1; bar <= 3; bar++)
    {
-      // Bullish rejection: long lower wick, small body at top
-      double lowerWick = MathMin(open1, close1) - low1;
-      bool rejection = (lowerWick / range1 > 0.6) && (close1 > open1);
+      double open1  = iOpen(symbol, InpEntryTF, bar);
+      double close1 = iClose(symbol, InpEntryTF, bar);
+      double high1  = iHigh(symbol, InpEntryTF, bar);
+      double low1   = iLow(symbol, InpEntryTF, bar);
       
-      // Bullish engulfing: current bullish candle engulfs previous bearish
-      bool engulfing = (close2 < open2) && (close1 > open1) && 
-                       (body1 > body2) && (close1 > open2) && (open1 < close2);
+      double open2  = iOpen(symbol, InpEntryTF, bar + 1);
+      double close2 = iClose(symbol, InpEntryTF, bar + 1);
       
-      return (rejection || engulfing);
-   }
-   else if(trend == TREND_BEARISH)
-   {
-      // Bearish rejection: long upper wick, small body at bottom
-      double upperWick = high1 - MathMax(open1, close1);
-      bool rejection = (upperWick / range1 > 0.6) && (close1 < open1);
+      double body1 = MathAbs(close1 - open1);
+      double range1 = high1 - low1;
+      double body2 = MathAbs(close2 - open2);
       
-      // Bearish engulfing: current bearish candle engulfs previous bullish
-      bool engulfing = (close2 > open2) && (close1 < open1) &&
-                       (body1 > body2) && (close1 < open2) && (open1 > close2);
+      if(range1 == 0) continue;
       
-      return (rejection || engulfing);
+      if(trend == TREND_BULLISH)
+      {
+         // 1. Bullish rejection (long lower wick)
+         double lowerWick = MathMin(open1, close1) - low1;
+         bool rejection = (lowerWick / range1 > 0.5) && (close1 > open1);
+         
+         // 2. Bullish engulfing
+         bool engulfing = (close2 < open2) && (close1 > open1) && 
+                          (body1 > body2 * 0.8) && (close1 > open2);
+         
+         // 3. Strong bullish candle (body > 60% of range)
+         bool strongBull = (close1 > open1) && (body1 / range1 > 0.6);
+         
+         if(rejection || engulfing || strongBull) return true;
+      }
+      else if(trend == TREND_BEARISH)
+      {
+         // 1. Bearish rejection (long upper wick)
+         double upperWick = high1 - MathMax(open1, close1);
+         bool rejection = (upperWick / range1 > 0.5) && (close1 < open1);
+         
+         // 2. Bearish engulfing
+         bool engulfing = (close2 > open2) && (close1 < open1) &&
+                          (body1 > body2 * 0.8) && (close1 < open2);
+         
+         // 3. Strong bearish candle
+         bool strongBear = (close1 < open1) && (body1 / range1 > 0.6);
+         
+         if(rejection || engulfing || strongBear) return true;
+      }
    }
    
    return false;
@@ -872,114 +844,58 @@ bool IsWithinTradingSession()
    TimeToStruct(TimeCurrent(), dt);
    int hour = dt.hour;
    
-   // London session
-   if(hour >= InpLondonStart && hour < InpLondonEnd)
-      return true;
-   
-   // NY first 2 hours
-   if(hour >= InpNYStart && hour < InpNYEnd)
-      return true;
+   if(hour >= InpLondonStart && hour < InpLondonEnd) return true;
+   if(hour >= InpNYStart && hour < InpNYEnd) return true;
    
    return false;
 }
 
 //+------------------------------------------------------------------+
-//| NEWS FILTER (Basic Implementation)                                |
+//| NEWS FILTER                                                       |
 //+------------------------------------------------------------------+
 bool IsNewsTime()
 {
-   // In backtesting, we can't access economic calendar reliably
-   // This is a placeholder - in live trading, integrate with calendar
-   // For now, use manual news time if set
-   
    if(g_newsTime == 0) return false;
-   
    datetime current = TimeCurrent();
    datetime newsStart = g_newsTime - InpNewsMinutes * 60;
    datetime newsEnd   = g_newsTime + InpNewsMinutes * 60;
-   
    return (current >= newsStart && current <= newsEnd);
 }
 
 //+------------------------------------------------------------------+
-//| QUALITY FILTERS                                                   |
+//| QUALITY FILTERS (RELAXED)                                        |
 //+------------------------------------------------------------------+
 bool PassQualityFilters(string symbol)
 {
-   // === Spread Filter ===
-   double spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
-   if(spread > InpMaxSpread) 
-   {
-      return false;
-   }
+   // Spread Filter
+   long spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
+   if(spread > (long)InpMaxSpread) return false;
    
-   // === ATR Filter (volatility check) ===
+   // ATR Filter
    int atrHandle = iATR(symbol, InpEntryTF, InpATR_Period);
-   if(atrHandle == INVALID_HANDLE) return true; // Skip if can't calculate
+   if(atrHandle == INVALID_HANDLE) return true;
    
    double atrBuffer[];
    ArraySetAsSeries(atrBuffer, true);
-   if(CopyBuffer(atrHandle, 0, 0, 2, atrBuffer) < 2) return true;
-   
-   // Get average ATR for comparison
-   double atrValues[];
-   ArraySetAsSeries(atrValues, true);
-   CopyBuffer(atrHandle, 0, 0, 50, atrValues);
-   
-   double avgATR = 0;
-   int count = ArraySize(atrValues);
-   for(int i = 0; i < count; i++) avgATR += atrValues[i];
-   if(count > 0) avgATR /= count;
-   
-   // If current ATR is too low compared to average
-   if(atrBuffer[0] < avgATR * InpMinATR_Multi)
+   if(CopyBuffer(atrHandle, 0, 0, 50, atrBuffer) < 50)
    {
-      return false;
+      IndicatorRelease(atrHandle);
+      return true; // Skip filter if not enough data
    }
+   
+   // Average ATR
+   double avgATR = 0;
+   for(int i = 0; i < 50; i++) avgATR += atrBuffer[i];
+   avgATR /= 50.0;
    
    IndicatorRelease(atrHandle);
-
-
-   // === Ranging Market Filter (narrow range) ===
-   double highestHigh = 0, lowestLow = 99999;
-   for(int i = 1; i <= 20; i++)
-   {
-      double h = iHigh(symbol, InpEntryTF, i);
-      double l = iLow(symbol, InpEntryTF, i);
-      if(h > highestHigh) highestHigh = h;
-      if(l < lowestLow) lowestLow = l;
-   }
-   double range20 = highestHigh - lowestLow;
    
-   // If 20-bar range is less than 1.5x ATR, market is too tight
-   if(range20 < atrBuffer[0] * 1.5)
-   {
+   // Current ATR too low = no trade
+   if(avgATR > 0 && atrBuffer[0] < avgATR * InpMinATR_Multi)
       return false;
-   }
    
-   // === Long Wick Filter (confused market) ===
-   double open1 = iOpen(symbol, InpEntryTF, 1);
-   double close1 = iClose(symbol, InpEntryTF, 1);
-   double high1 = iHigh(symbol, InpEntryTF, 1);
-   double low1 = iLow(symbol, InpEntryTF, 1);
-   
-   double body = MathAbs(close1 - open1);
-   double totalRange = high1 - low1;
-   
-   if(totalRange > 0)
-   {
-      double wickRatio = 1.0 - (body / totalRange);
-      if(wickRatio > InpMaxWickRatio)
-      {
-         return false;
-      }
-   }
-   
-   // === News Filter ===
-   if(IsNewsTime())
-   {
-      return false;
-   }
+   // News filter
+   if(IsNewsTime()) return false;
    
    return true;
 }
@@ -995,21 +911,21 @@ double CalculateLotSize(string symbol, double slDistance)
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskAmount = balance * (InpRiskPercent / 100.0);
    
-   // Get tick value
    double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
    double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    
-   if(tickSize == 0 || tickValue == 0) return 0;
+   if(tickSize == 0 || tickValue == 0 || point == 0) return 0;
    
-   // Calculate lots
-   double slPoints = slDistance / point;
-   double lotSize = riskAmount / (slPoints * tickValue / (tickSize / point));
+   double slTicks = slDistance / tickSize;
+   double lotSize = riskAmount / (slTicks * tickValue);
    
    // Normalize
    double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   
+   if(lotStep == 0) lotStep = 0.01;
    
    lotSize = MathFloor(lotSize / lotStep) * lotStep;
    lotSize = MathMax(lotSize, minLot);
@@ -1019,12 +935,11 @@ double CalculateLotSize(string symbol, double slDistance)
 }
 
 //+------------------------------------------------------------------+
-//| GET SL MARGIN BASED ON SYMBOL                                    |
+//| GET SL MARGIN                                                    |
 //+------------------------------------------------------------------+
 double GetSLMargin(string symbol)
 {
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   
    if(StringFind(symbol, "XAU") >= 0 || StringFind(symbol, "GOLD") >= 0)
       return InpSL_MarginGold * point;
    else
@@ -1032,7 +947,7 @@ double GetSLMargin(string symbol)
 }
 
 //+------------------------------------------------------------------+
-//| COUNT OPEN POSITIONS FOR SYMBOL                                  |
+//| COUNT POSITIONS                                                  |
 //+------------------------------------------------------------------+
 int CountPositions(string symbol)
 {
@@ -1046,6 +961,22 @@ int CountPositions(string symbol)
       }
    }
    return count;
+}
+
+//+------------------------------------------------------------------+
+//| NORMALIZE VOLUME                                                  |
+//+------------------------------------------------------------------+
+double NormalizeVolume(string symbol, double volume)
+{
+   double minVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double stepVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   if(stepVol == 0) stepVol = 0.01;
+   
+   volume = MathFloor(volume / stepVol) * stepVol;
+   volume = MathMax(volume, minVol);
+   volume = MathMin(volume, maxVol);
+   return volume;
 }
 
 
@@ -1068,6 +999,7 @@ void ManageOpenPositions()
       ulong ticket = posInfo.Ticket();
       
       double riskDistance = MathAbs(openPrice - sl);
+      if(riskDistance == 0) continue;
       
       if(posType == POSITION_TYPE_BUY)
       {
@@ -1077,9 +1009,8 @@ void ManageOpenPositions()
          // Move to Break Even at 1:1
          if(profit >= riskDistance && sl < openPrice)
          {
-            double newSL = openPrice + SymbolInfoDouble(symbol, SYMBOL_POINT);
+            double newSL = openPrice + SymbolInfoDouble(symbol, SYMBOL_POINT) * 2;
             trade.PositionModify(ticket, newSL, tp);
-            Print("Moved to BE: ", symbol, " ticket: ", ticket);
          }
          
          // Partial close at 2:1
@@ -1087,11 +1018,9 @@ void ManageOpenPositions()
          {
             double volume = posInfo.Volume();
             double closeVolume = NormalizeVolume(symbol, volume * (InpPartialPercent / 100.0));
-            
             if(closeVolume > 0 && volume > closeVolume)
             {
                trade.PositionClosePartial(ticket, closeVolume);
-               Print("Partial close: ", symbol, " volume: ", closeVolume);
             }
          }
       }
@@ -1103,9 +1032,8 @@ void ManageOpenPositions()
          // Move to Break Even at 1:1
          if(profit >= riskDistance && sl > openPrice)
          {
-            double newSL = openPrice - SymbolInfoDouble(symbol, SYMBOL_POINT);
+            double newSL = openPrice - SymbolInfoDouble(symbol, SYMBOL_POINT) * 2;
             trade.PositionModify(ticket, newSL, tp);
-            Print("Moved to BE: ", symbol, " ticket: ", ticket);
          }
          
          // Partial close at 2:1
@@ -1113,33 +1041,15 @@ void ManageOpenPositions()
          {
             double volume = posInfo.Volume();
             double closeVolume = NormalizeVolume(symbol, volume * (InpPartialPercent / 100.0));
-            
             if(closeVolume > 0 && volume > closeVolume)
             {
                trade.PositionClosePartial(ticket, closeVolume);
-               Print("Partial close: ", symbol, " volume: ", closeVolume);
             }
          }
       }
    }
 }
 
-
-//+------------------------------------------------------------------+
-//| NORMALIZE VOLUME                                                  |
-//+------------------------------------------------------------------+
-double NormalizeVolume(string symbol, double volume)
-{
-   double minVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-   double maxVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-   double stepVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-   
-   volume = MathFloor(volume / stepVol) * stepVol;
-   volume = MathMax(volume, minVol);
-   volume = MathMin(volume, maxVol);
-   
-   return volume;
-}
 
 //+------------------------------------------------------------------+
 //| RESET DAILY COUNTERS                                              |
@@ -1162,7 +1072,7 @@ void ResetDailyCounters()
    double todayProfit = GetTodayProfit();
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    
-   if(todayProfit < 0 && MathAbs(todayProfit) >= balance * (InpMaxDailyLoss / 100.0))
+   if(balance > 0 && todayProfit < 0 && MathAbs(todayProfit) >= balance * (InpMaxDailyLoss / 100.0))
    {
       g_dailyLimitHit = true;
    }
@@ -1174,13 +1084,10 @@ void ResetDailyCounters()
 double GetTodayProfit()
 {
    double profit = 0;
-   
-   // Check closed trades today
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    datetime todayStart = StringToTime(StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day));
    
-   // Select history for today
    HistorySelect(todayStart, TimeCurrent());
    
    int totalDeals = HistoryDealsTotal();
@@ -1188,7 +1095,6 @@ double GetTodayProfit()
    {
       ulong dealTicket = HistoryDealGetTicket(i);
       if(dealTicket == 0) continue;
-      
       if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == InpMagicNumber)
       {
          profit += HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
@@ -1212,16 +1118,15 @@ double GetTodayProfit()
 
 
 //+------------------------------------------------------------------+
-//| ON TRADE EVENT - Track daily trades                              |
+//| ON TRADE EVENT                                                   |
 //+------------------------------------------------------------------+
 void OnTrade()
 {
-   // Update daily P&L tracking
    g_todayPnL = GetTodayProfit();
 }
 
 //+------------------------------------------------------------------+
-//| CHART COMMENT - Display EA Status                                |
+//| DISPLAY STATUS ON CHART                                          |
 //+------------------------------------------------------------------+
 void DisplayStatus(string symbol)
 {
@@ -1229,36 +1134,41 @@ void DisplayStatus(string symbol)
    string trendStr = (trend == TREND_BULLISH) ? "BULLISH" :
                      (trend == TREND_BEARISH) ? "BEARISH" : "RANGING";
    
+   int symIdx = (symbol == InpSymbol1) ? 0 : 1;
+   
    string status = StringFormat(
-      "=== ICT Smart Money EA ===\n"
-      "Symbol: %s\n"
+      "=== ICT Smart Money EA v2.0 ===\n"
+      "Symbol: %s | TF: %s\n"
       "H1 Trend: %s\n"
+      "Sweep Detected: %s (Level: %.5f)\n"
+      "MSS Detected: %s\n"
       "Today Trades: %d / %d\n"
       "Today P&L: %.2f\n"
       "Daily Limit: %s\n"
       "Session Active: %s\n"
-      "Spread: %.1f\n",
-      symbol, trendStr,
+      "Spread: %d pts\n",
+      symbol, EnumToString(InpEntryTF),
+      trendStr,
+      g_sweepDetected[symIdx] ? "YES" : "NO", g_sweepLevel[symIdx],
+      g_mssDetected[symIdx] ? "YES" : "NO",
       g_todayTrades, InpMaxTradesDay,
       g_todayPnL,
-      g_dailyLimitHit ? "HIT" : "OK",
+      g_dailyLimitHit ? "HIT - STOPPED" : "OK",
       IsWithinTradingSession() ? "YES" : "NO",
-      (double)SymbolInfoInteger(symbol, SYMBOL_SPREAD)
+      (int)SymbolInfoInteger(symbol, SYMBOL_SPREAD)
    );
    
    Comment(status);
 }
 
 //+------------------------------------------------------------------+
-//| TESTER EVENT - For backtesting statistics                        |
+//| TESTER EVENT                                                      |
 //+------------------------------------------------------------------+
 double OnTester()
 {
-   // Return custom optimization criterion
-   // Profit Factor * Win Rate gives balanced metric
    double profitFactor = TesterStatistics(STAT_PROFIT_FACTOR);
-   double winRate = 0;
    double totalTrades = TesterStatistics(STAT_TRADES);
+   double winRate = 0;
    
    if(totalTrades > 0)
    {
@@ -1266,10 +1176,7 @@ double OnTester()
       winRate = profitTrades / totalTrades;
    }
    
-   // Custom criterion: PF * WinRate * sqrt(trades)
-   // Penalizes low trade count, rewards consistency
-   double criterion = profitFactor * winRate * MathSqrt(totalTrades);
-   
-   return criterion;
+   // Custom: PF * WinRate * sqrt(trades) - balanced metric
+   return profitFactor * winRate * MathSqrt(totalTrades);
 }
 //+------------------------------------------------------------------+
